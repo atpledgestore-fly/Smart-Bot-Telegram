@@ -751,7 +751,7 @@ BOOKS_DATABASE = {
         "details": "The official ICAO manual specifying air traffic control procedures in detail. It is a fundamental reference for air traffic controllers and flight crews operating internationally, covering separation minima, ATS surveillance services, emergency procedures, and air traffic control clearances.",
         "price_usd": 0.0,
         "cover_url": "AgACAgQAAxkBAAICdmqSEWSr2vUg5MI8ZgoXFUI2QmU6AAJDEGsb8e6QUKOKRSCLV_6BAQADAgADeAADPQQ",
-        "file_url": "https://drive.google.com/file/d/1eCHfTjCJWileQPnQ3MBMgmfK5wcJzbd3/view?usp=sharing"
+        "file_url": "https://drive.google.com/file/d/1HtyIecWuy07c3HXmIM4ZRaH-yAadcEzR/view?usp=sharing"
     },
     "book_free_2": {
         "category_id": "cat_free_books",
