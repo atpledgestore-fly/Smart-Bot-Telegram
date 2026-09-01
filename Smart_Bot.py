@@ -46,7 +46,7 @@ def keep_alive():
 # ---------------------------------------------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured in environment variables.")
+    raise RuntimeError("BOT_TOKEN is not configured in environment variables.")
 
 STORE_EMAIL = "Atpledgestore@Gmail.com"
 WHATSAPP_NUMBER = "218925869198"
