@@ -44,7 +44,7 @@ def keep_alive():
 # ---------------------------------------------------------
 # 1. Configuration & Details (Secure Environment Variables)
 # ---------------------------------------------------------
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not configured in environment variables.")
 
