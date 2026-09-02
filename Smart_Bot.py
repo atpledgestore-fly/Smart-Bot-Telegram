@@ -2038,7 +2038,8 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
 # ---------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------
-if __name__ == "__main__":
+async def main():
+    """Main async function"""
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     application = (
         ApplicationBuilder()
@@ -2065,11 +2066,17 @@ if __name__ == "__main__":
 
     print("🤖 ATPL Edge Bot is running...")
     
+    # تشغيل Flask في خيط منفصل
     keep_alive()
     
-    # استخدام asyncio.run لتشغيل البوت
+    # تشغيل البوت
+    await application.run_polling()
+
+if __name__ == "__main__":
     try:
-        asyncio.run(application.run_polling())
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
         raise
