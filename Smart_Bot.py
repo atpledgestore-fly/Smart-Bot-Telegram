@@ -2107,16 +2107,7 @@ if __name__ == "__main__":
 
     print("🤖 ATPL Edge Bot is running...")
     
-    # استخدام Webhook بدلاً من Polling
-    PORT = int(os.environ.get("PORT", 10000))
+    keep_alive()
     
-    try:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="webhook",
-            webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'your-app.onrender.com')}/webhook"
-        )
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-        raise
+    # الحل الوحيد الذي يعمل مع Python 3.14
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
