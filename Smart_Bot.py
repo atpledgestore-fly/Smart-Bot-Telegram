@@ -2,9 +2,33 @@ import logging
 import time
 import os
 import asyncio
-from datetime import datetime
+import json
+import uuid
+import gc
+from datetime import datetime, timedelta
 from threading import Thread
-from flask import Flask
+
+# Flask Web Server
+try:
+    from flask import Flask
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def home():
+        return "Bot is running successfully!"
+    
+    def run_server():
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host='0.0.0.0', port=port)
+    
+    def keep_alive():
+        t = Thread(target=run_server)
+        t.daemon = True
+        t.start()
+except ImportError:
+    print("Warning: Flask not installed - running without web server")
+    def keep_alive():
+        pass
 
 from telegram import (
     BotCommand,
@@ -25,83 +49,345 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 # ---------------------------------------------------------
-# Flask Web Server (Keep-Alive for Render Free Tier)
+# Secure Configuration - Environment Variables Only
 # ---------------------------------------------------------
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running successfully!"
-
-def run_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_server)
-    t.start()
-
-# ---------------------------------------------------------
-# 1. Configuration & Details (Secure Environment Variables)
-# ---------------------------------------------------------
+# Bot Token - Required
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not configured in environment variables.")
 
+# Admin User ID - Required
+ADMIN_USER_ID_STR = os.getenv("ADMIN_USER_ID")
+if not ADMIN_USER_ID_STR:
+    raise RuntimeError("ADMIN_USER_ID is not configured in environment variables.")
+ADMIN_USER_ID = int(ADMIN_USER_ID_STR)
+
+# Notification Channel ID - Required
+NOTIFICATION_CHANNEL_ID_STR = os.getenv("NOTIFICATION_CHANNEL_ID")
+if not NOTIFICATION_CHANNEL_ID_STR:
+    raise RuntimeError("NOTIFICATION_CHANNEL_ID is not configured in environment variables.")
+NOTIFICATION_CHANNEL_ID = int(NOTIFICATION_CHANNEL_ID_STR)
+
+# Non-sensitive Information
 STORE_EMAIL = "Atpledgestore@Gmail.com"
 WHATSAPP_NUMBER = "218925869198"
 WHATSAPP_URL = f"https://wa.me/{WHATSAPP_NUMBER}"
 
-# Social Media Links
 TELEGRAM_URL = "https://t.me/ATPLEdge"
 INSTAGRAM_URL = "https://www.instagram.com/capt.salem_albarghti"
 TIKTOK_URL = "https://www.tiktok.com/@capt_salemalbarghti"
 PINTEREST_URL = "https://pin.it/1izN38UZ8"
 
-# Admin User ID (Loaded securely from environment variables with fallback)
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "869423522"))
+STARS_PER_USD = 50
 
-# Logging Setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
+
+user_carts = {}
+user_cart_messages = {}
+user_agreed_terms = set()
+user_cart_timestamps = {}
+completed_orders = {}
+order_history = {}
+user_last_message_id = {}
+cart_creation_notified = set()
+
+CART_EXPIRY_HOURS = 24
+BACKUP_FILE = "orders_backup.json"
 
 # ---------------------------------------------------------
-# Startup & Main Execution Setup
+# Backup System
 # ---------------------------------------------------------
-async def post_init(application):
-    await application.bot.delete_my_commands()
-    commands = [
-        BotCommand("start", "Launch the ATPL Edge Bot & Main Menu"),
-        BotCommand("shop", "Browse Professional Aviation Catalog"),
-        BotCommand("cart", "View your active shopping cart"),
-    ]
-    await application.bot.set_my_commands(commands)
+def save_order_backup(order_data):
+    try:
+        with open(BACKUP_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(order_data, ensure_ascii=False) + '\n')
+        logger.info("Order backup saved")
+    except Exception as e:
+        logger.error(f"Failed to save backup: {e}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
-    welcome_msg = f"Welcome aboard, Captain {user_name}! 👨‍✈️✈️\n\nWelcome to **ATPL Edge Store**."
-    if update.message:
-        await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+def load_order_history():
+    try:
+        if os.path.exists(BACKUP_FILE):
+            with open(BACKUP_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        order = json.loads(line)
+                        order_history[order.get('order_id')] = order
+                    except:
+                        continue
+            logger.info(f"Loaded {len(order_history)} orders")
+    except Exception as e:
+        logger.error(f"Failed to load backup: {e}")
 
-if __name__ == "__main__":
-    keep_alive()
-    application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+# ---------------------------------------------------------
+# Cart Management
+# ---------------------------------------------------------
+def cleanup_old_carts():
+    now = datetime.now()
+    expired_users = []
     
-    # Add Handlers here
-    application.add_handler(CommandHandler("start", start))
+    for user_id, timestamp in user_cart_timestamps.items():
+        if now - timestamp > timedelta(hours=CART_EXPIRY_HOURS):
+            expired_users.append(user_id)
+    
+    for user_id in expired_users:
+        user_carts.pop(user_id, None)
+        user_cart_messages.pop(user_id, None)
+        user_cart_timestamps.pop(user_id, None)
+        logger.info(f"Cart deleted for user {user_id}")
+    
+    if expired_users:
+        gc.collect()
+    
+    return expired_users
 
-    logging.info("Starting secure bot polling...")
+def update_cart_timestamp(user_id):
+    user_cart_timestamps[user_id] = datetime.now()
 
-import asyncio
+def get_cart_remaining_time(user_id):
+    if user_id in user_cart_timestamps:
+        expiry = user_cart_timestamps[user_id] + timedelta(hours=CART_EXPIRY_HOURS)
+        remaining = expiry - datetime.now()
+        if remaining.total_seconds() > 0:
+            hours = int(remaining.total_seconds() // 3600)
+            minutes = int((remaining.total_seconds() % 3600) // 60)
+            return hours, minutes
+    return 0, 0
 
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# ---------------------------------------------------------
+# Admin Notification System
+# ---------------------------------------------------------
+async def send_admin_notification(context, order_data, is_free_items=False):
+    """Send purchase notification to private channel and admin DM"""
+    order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
+    order_data['order_id'] = order_id
+    
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    
+    items_list = "\n".join([f"📚 {i+1}. {item['title']}" for i, item in enumerate(order_data['items'])])
+    
+    if is_free_items:
+        order_type = "🎁 FREE ITEMS CLAIMED"
+    else:
+        order_type = "💰 NEW PURCHASE"
+    
+    admin_message = f"""
+🔔 *{order_type}* 🔔
 
-    application.run_polling()
+━━━━━━━━━━━━━━━━━━━━━
+📋 *ORDER DETAILS:*
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Order ID: `{order_id}`
+👤 User ID: `{order_data['user_id']}`
+📝 Username: @{order_data.get('user_name', 'Unknown')}
+👨‍✈️ Full Name: {order_data.get('full_name', 'Unknown')}
+
+━━━━━━━━━━━━━━━━━━━━━
+📚 *ITEMS:*
+━━━━━━━━━━━━━━━━━━━━━
+{items_list}
+
+━━━━━━━━━━━━━━━━━━━━━
+💰 *PAYMENT DETAILS:*
+━━━━━━━━━━━━━━━━━━━━━
+💵 USD Amount: ${order_data['total_usd']:.2f}
+⭐ Telegram Stars: {order_data['total_stars']} Stars
+💳 Payment ID: `{order_data.get('charge_id', 'N/A')}`
+
+━━━━━━━━━━━━━━━━━━━━━
+📅 *DATE & TIME:*
+━━━━━━━━━━━━━━━━━━━━━
+📆 Date: {date_str}
+⏰ Time: {time_str} UTC
+
+━━━━━━━━━━━━━━━━━━━━━
+📊 *SUMMARY:*
+━━━━━━━━━━━━━━━━━━━━━
+📦 Total Items: {len(order_data['items'])}
+🎁 Free Items: {order_data.get('free_items', 0)}
+💎 Paid Items: {order_data.get('paid_items', 0)}
+🔥 Discount: {'Yes (10%)' if order_data.get('discount_applied') else 'No'}
+"""
+
+    if is_free_items:
+        admin_message += "\n🎁 *FREE ITEMS - NO PAYMENT REQUIRED*\n"
+    
+    admin_message += "━━━━━━━━━━━━━━━━━━━━━"
+    
+    completed_orders[order_id] = order_data
+    order_history[order_id] = order_data
+    save_order_backup(order_data)
+    
+    # 1. Send to private channel
+    channel_sent = False
+    try:
+        await context.bot.send_message(
+            chat_id=NOTIFICATION_CHANNEL_ID,
+            text=admin_message,
+            parse_mode="Markdown"
+        )
+        logger.info(f"✅ Order notification sent to private channel for order {order_id}")
+        channel_sent = True
+    except Exception as e:
+        logger.error(f"❌ Failed to send to channel: {e}")
+    
+    # 2. Send short notification to admin DM
+    try:
+        if channel_sent:
+            short_notification = (
+                f"📢 *New Order Received!*\n\n"
+                f"🆔 Order ID: `{order_id}`\n"
+                f"👤 User: @{order_data.get('user_name', 'Unknown')}\n"
+                f"💰 Amount: ${order_data['total_usd']:.2f}\n"
+                f"📅 Date: {date_str} {time_str}\n\n"
+                f"📋 *Full details in private channel.*"
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=short_notification,
+                parse_mode="Markdown"
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=admin_message,
+                parse_mode="Markdown"
+            )
+        logger.info(f"✅ Admin DM notification sent for order {order_id}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send admin DM notification: {e}")
+    
+    return order_id
+
+# ---------------------------------------------------------
+# Cart Expiry Notifications
+# ---------------------------------------------------------
+async def send_cart_expiry_notice(user_id, context, hours_remaining):
+    try:
+        message = f"""
+⏰ *CART EXPIRY WARNING*
+
+Your shopping cart will expire soon!
+
+⏳ Time Remaining: {hours_remaining} hours
+
+⚠️ *IMPORTANT:*
+Your cart will be automatically deleted after 24 hours.
+Please complete your purchase before the time runs out.
+
+💡 *TIP:* You can remove items manually using the "Remove" button.
+"""
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=message,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send expiry notice: {e}")
+
+async def check_cart_expiry(context):
+    now = datetime.now()
+    
+    for user_id, timestamp in list(user_cart_timestamps.items()):
+        hours_passed = (now - timestamp).total_seconds() / 3600
+        
+        if hours_passed >= 18 and hours_passed < 19:
+            await send_cart_expiry_notice(user_id, context, 6)
+        
+        elif hours_passed >= 23 and hours_passed < 24:
+            await send_cart_expiry_notice(user_id, context, 1)
+        
+        elif hours_passed >= 24:
+            user_carts.pop(user_id, None)
+            user_cart_messages.pop(user_id, None)
+            user_cart_timestamps.pop(user_id, None)
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="🗑️ *Cart automatically deleted*\n\nYour cart has expired (24 hours).",
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
+
+# ---------------------------------------------------------
+# Sales Report
+# ---------------------------------------------------------
+async def sales_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ This command is for admin only")
+        return
+    
+    if not completed_orders:
+        await update.message.reply_text("📊 No sales recorded yet")
+        return
+    
+    total_orders = len(completed_orders)
+    total_revenue = sum(order.get('total_usd', 0) for order in completed_orders.values())
+    total_stars = sum(order.get('total_stars', 0) for order in completed_orders.values())
+    
+    today = datetime.now().date()
+    today_orders = [o for o in completed_orders.values() if o.get('date') == today.strftime("%Y-%m-%d")]
+    today_revenue = sum(o.get('total_usd', 0) for o in today_orders)
+    
+    report = f"""
+📊 *SALES REPORT*
+
+━━━━━━━━━━━━━━━━━━━━━
+📦 Total Orders: {total_orders}
+💰 Total Revenue: ${total_revenue:.2f}
+⭐ Total Stars: {total_stars}
+
+📅 Today's Orders: {len(today_orders)}
+💵 Today's Revenue: ${today_revenue:.2f}
+━━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    await update.message.reply_text(report, parse_mode="Markdown")
+
+# ---------------------------------------------------------
+# Order History
+# ---------------------------------------------------------
+async def orders_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    user_orders = [o for o in completed_orders.values() if o.get('user_id') == user_id]
+    
+    if not user_orders:
+        text = "📋 *No Previous Orders Found*\n\nYou don't have any previous orders yet."
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
+        ])
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+        return
+    
+    history_text = f"📋 *YOUR ORDER HISTORY* ({len(user_orders)} orders):\n\n"
+    
+    for i, order in enumerate(user_orders[-10:], 1):
+        history_text += f"""
+━━━━━━━━━━━━━━━━━━━━━
+📦 *Order {i}:*
+🆔 ID: `{order.get('order_id', 'N/A')}`
+📅 Date: {order.get('date', 'N/A')} {order.get('time', '')}
+💰 Amount: ${order.get('total_usd', 0):.2f}
+📚 Items: {len(order.get('items', []))} items
+━━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
+    ])
+    await update.message.reply_text(history_text, parse_mode="Markdown", reply_markup=markup)
 
 # ---------------------------------------------------------
 # 2. Books & Videos Database (Including Free Aviation Books)
@@ -249,7 +535,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Air Law",
-        "details": "A foundational textbook for the EASA ATPL theoretical knowledge exams.",
+        "details": "A foundational textbook for the EASA ATPL theoretical knowledge exams[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB6mqR1TeIxXhfa7C-XKSvd6ME357BAAKYD2sb8e6QUEC7uzjz6gNVAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1807g61SK-DwApBQXFo1GeLf1eWmzAxs7/view?usp=sharing",
@@ -258,7 +544,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Airframes and Systems",
-        "details": "A core EASA ATPL textbook comprehensively covering aircraft general knowledge.",
+        "details": "A core EASA ATPL textbook comprehensively covering aircraft general knowledge[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB8GqR10rpA52dC2zxBc1YvVzvJKPFAAKZD2sb8e6QUOIpRmcqD4_PAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1ecUKXt6nJ1Zp_ugQS79xA4SS5_6vzacT/view?usp=sharing",
@@ -267,7 +553,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Electrics and Electronics",
-        "details": "A core EASA ATPL textbook covering aircraft electrical and electronic systems.",
+        "details": "A core EASA ATPL textbook covering aircraft electrical and electronic systems[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB8mqR13872CkpUj0mcxouF_Tmg6GjAAKbD2sb8e6QUGx6P0yNgV7iAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1SBWAITgfIceEwDKm5OJ_aQ2tJMxBHEDA/view?usp=sharing",
@@ -276,7 +562,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Powerplant",
-        "details": "A core EASA ATPL textbook covering the principles and systems of aircraft engines.",
+        "details": "A core EASA ATPL textbook covering the principles and systems of aircraft engines[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB9GqR18xR7E3n3Ci3pCuSI9tO7yyPAAKcD2sb8e6QUGntJb2kTHVoAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/10KcazEBvNcekZEqqxpmD1wzQtG-CZWDL/view?usp=sharing",
@@ -285,7 +571,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Instrumentation",
-        "details": "A core EASA ATPL textbook covering the full spectrum of aircraft instrumentation.",
+        "details": "A core EASA ATPL textbook covering the full spectrum of aircraft instrumentation[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB9mqR2Aj8SIceTRhgdYfNyLQXTQGdAAKdD2sb8e6QUJxZon0Tc33tAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1d-ZtqbQaum8tpmUhIzQSUm-OVlXW1Gec/view?usp=sharing",
@@ -294,7 +580,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Mass and Balance · Performance",
-        "details": "A core EASA ATPL textbook covering mass, balance, and performance calculations.",
+        "details": "A core EASA ATPL textbook covering mass, balance, and performance calculations[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB-GqR2EI_vAPimVmxOeSVgmchwC1HAAKeD2sb8e6QUCS7AuadGJarAQADAgADeAADPQQ",
         "file_url": "https://drive.google.com/file/d/1z-FW_ercC0d2MVl0aY2aKwYuK59mbUbF/view?usp=sharing",
@@ -303,7 +589,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Flight Planning and Monitoring",
-        "details": "A core EASA ATPL textbook covering essential knowledge for flight planning.",
+        "details": "A core EASA ATPL textbook covering essential knowledge for flight planning[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB-mqR2MUipn9sB3qmSPdavF3t4HwFAAKfD2sb8e6QUEMbiEYEH6mVAQADAgADbQADPQQ",
         "file_url": "https://drive.google.com/file/d/1dn9zytYld-e3Omp7KLTLjH8xdznoSrsx/view?usp=sharing",
@@ -312,7 +598,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Human Performance and Limitations",
-        "details": "A core EASA ATPL textbook covering physiological and psychological factors.",
+        "details": "A core EASA ATPL textbook covering physiological and psychological factors[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB_GqR2Nz__578MQABrKru1q07x615LQACoA9rG_HukFB9IfQUhdi0RgEAAwIAA3kAAz0E",
         "file_url": "https://drive.google.com/file/d/1mydmsJDbSVFcBQ893PEflhxkUX9O2kRD/view?usp=sharing",
@@ -321,7 +607,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Meteorology",
-        "details": "A core EASA ATPL textbook covering essential meteorological knowledge.",
+        "details": "A core EASA ATPL textbook covering essential meteorological knowledge[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAIB_mqR2RM6_OfRyqdTR7og8QJh18VCAAKhD2sb8e6QUApCA3w37DZBAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1unQxLi6i9J_8fYy96qudbpk-i86kBy01/view?usp=sharing",
@@ -330,7 +616,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "General Navigation",
-        "details": "A core EASA ATPL textbook covering foundational principles of air navigation.",
+        "details": "A core EASA ATPL textbook covering foundational principles of air navigation[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAICAAFqkdk_wj36-7ZjHJ7E5pwaVdee7QACog9rG_HukFAPt0BxxcFyaAEAAwIAA3kAAz0E",
         "file_url": "https://drive.google.com/file/d/1xa0Ggx9ug3NDXpYspCTOx5F1qB2WsLFg/view?usp=sharing",
@@ -339,7 +625,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Radio Navigation",
-        "details": "A core EASA ATPL textbook covering theory and application of radio navigation.",
+        "details": "A core EASA ATPL textbook covering theory and application of radio navigation[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAICAmqR2Xm8y1PAhh3HkaPN-cJMBjyrAAKjD2sb8e6QUPqLu27u5BsuAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1bk_bC8eJMRrWYA60lraY6ZoDMwAKQ0sY/view?usp=sharing",
@@ -348,7 +634,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Operational Procedures",
-        "details": "A core EASA ATPL textbook covering regulatory and procedural requirements.",
+        "details": "A core EASA ATPL textbook covering regulatory and procedural requirements[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAICBGqR2adUx_FKPfR-rl3J1Y3n_qtjAAKkD2sb8e6QUJkEbRDqN1t8AQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1uQnHk6k6qwXTBMQUevCDlyalAs62RPGr/view?usp=sharing",
@@ -357,7 +643,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Principles of Flight",
-        "details": "A core EASA ATPL textbook building a strong foundation in aerodynamics.",
+        "details": "A core EASA ATPL textbook building a strong foundation in aerodynamics[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAICBmqR2dzaroVen3RqklZayAShHccoAAKlD2sb8e6QUEa_Ev1v9BXUAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1N9i_GQpWJtKOXXs5sCl68MUJ33o5TWNT/view?usp=sharing",
@@ -366,7 +652,7 @@ BOOKS_DATABASE = {
         "category_id": "cat_cae_2014",
         "category_name": "📚 CAE Oxford ATPL 2014 Collection",
         "title": "Communications",
-        "details": "A core EASA ATPL textbook covering radiotelephony procedures and phraseology.",
+        "details": "A core EASA ATPL textbook covering radiotelephony procedures and phraseology[cite: 2].",
         "price_usd": 5.99,
         "cover_url": "AgACAgQAAxkBAAICCGqR2xa8f-Slq_-9zRtqFyCep10MAAKnD2sb8e6QUETbfD8ardaKAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/1K24-dqh-v04K-YzH0sAek5E9FWP3w6DN/view?usp=sharing",
@@ -433,7 +719,7 @@ BOOKS_DATABASE = {
         "title": "Aircraft Weight and Balance Handbook (FAA-H-8083-1A)",
         "details": "The official FAA guide for pilots and mechanics on weight and balance principles. It includes methods for weighing aircraft, determining the center of gravity, and performing loading computations to ensure safe and efficient flight.",
         "price_usd": 14.99,
-        "cover_url": "AgACAgQAAxkBAAICQ2qSA-yX4UY7Mh9MNaYlgbLMUG5xAAIqEGsb8e6QUGPrRZSqo0HpAQADAgADeAADPQQ",
+        "cover_url": "AgACAgQAAxkBAAICQ2qSA-yX4UY7Mh9MNaYlgbLMUG5xAAIqEGsb8e6QUGPrRZSq0oHpAQADAgADeAADPQQ",
         "file_url": "https://drive.google.com/file/d/1sbiAVuz1Es0PDYivyCUk6PnP2Fff6Z5j/view?usp=sharing",
     },
     "book_faa_8": {
@@ -446,14 +732,14 @@ BOOKS_DATABASE = {
         "file_url": "https://drive.google.com/file/d/17gGPVHSsduvC67DTbOaYedaRZu_0tv6v/view?usp=sharing",
     },
     "book_faa_9": {
-        "category_id": "cat_faa_books",
-        "category_name": "📘 FAA Books",
-        "title": "Airplane Flying Handbook (FAA-H-8083-3B)",
-        "details": "The official FAA guide for pilots, covering everything from ground operations and basic flight maneuvers to stalls, spins, takeoffs, landings, and emergency procedures. It is an essential reference for student pilots and those preparing for additional certificates.",
-        "price_usd": 14.99,
-        "cover_url": "AgACAgQAAxkBAAIC3mqS_Zpxc1NFeyA5-PnvN7-n9B8fAALIEGsbw7WYUDFrHXgwS8HVAQADAgADeAADPQQ",
-        "file_url": "https://drive.google.com/file/d/1wvTHog8W85Ub_VXl51rLpYpAL_KVNOwt/view?usp=sharing",
-    },
+    "category_id": "cat_faa_books",
+    "category_name": "📘 FAA Books",
+    "title": "Airplane Flying Handbook (FAA-H-8083-3B)",
+    "details": "The official FAA guide for pilots, covering everything from ground operations and basic flight maneuvers to stalls, spins, takeoffs, landings, and emergency procedures. It is an essential reference for student pilots and those preparing for additional certificates.",
+    "price_usd": 14.99,
+    "cover_url": "AgACAgQAAxkBAAIC3mqS_Zpxc1NFeyA5-PnvN7-n9B8fAALIEGsbw7WYUDFrHXgwS8HVAQADAgADeAADPQQ",
+    "file_url": "https://drive.google.com/file/d/1wvTHog8W85Ub_VXl51rLpYpAL_KVNOwt/view?usp=sharing",
+        },
     "book_faa_10": {
         "category_id": "cat_faa_books",
         "category_name": "📘 FAA Books",
@@ -671,7 +957,7 @@ BOOKS_DATABASE = {
         "title": "Communication - CBT Video Course",
         "details": "Essential radiotelephony module featuring 19 videos covering VFR/IFR communication procedures and phraseology.",
         "price_usd": 19.99,
-        "cover_url": "AgACAgQAAxkBAAIC9GqTHsXsYkJ-xTImZKbxu7lHhVCeAAIPEWsbw7WYUNObKJT19aeZmAQADAgADeQADPQQ",
+        "cover_url": "AgACAgQAAxkBAAIC9GqTHsXsYkJ-xTImZKbxu7lHhVCeAAIPEWsbw7WYUObKJT19aeZmAQADAgADeQADPQQ",
         "file_url": "https://drive.google.com/file/d/sample_comm_link/view?usp=sharing"
     },
     "video_cbt_7": {
@@ -949,41 +1235,32 @@ BOOKS_DATABASE = {
         "file_url": "https://drive.google.com/file/d/1Ag4G9KehOkEF7WIcG006sU4K10O7Yqet/view?usp=sharing",
     },
 }
-
 # ---------------------------------------------------------
-# 3. Keyboards & Menus
+# Keyboards
 # ---------------------------------------------------------
 def get_terms_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ I Agree to Terms & Conditions", callback_data="agree_terms")]
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ I Agree to Terms & Conditions", callback_data="agree_terms")]
+    ])
 
 def get_whatsapp_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💬 Connect with Support via WhatsApp", url=WHATSAPP_URL)],
-            [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Connect via WhatsApp", url=WHATSAPP_URL)],
+        [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
+    ])
 
 def get_socials_keyboard():
-    return InlineKeyboardMarkup(
+    return InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton("📢 Telegram Channel", url=TELEGRAM_URL),
-                InlineKeyboardButton("📸 Instagram", url=INSTAGRAM_URL),
-            ],
-            [
-                InlineKeyboardButton("🎵 TikTok", url=TIKTOK_URL),
-                InlineKeyboardButton("📌 Pinterest", url=PINTEREST_URL),
-            ],
-            [
-                InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")
-            ]
-        ]
-    )
+            InlineKeyboardButton("📢 Telegram Channel", url=TELEGRAM_URL),
+            InlineKeyboardButton("📸 Instagram", url=INSTAGRAM_URL),
+        ],
+        [
+            InlineKeyboardButton("🎵 TikTok", url=TIKTOK_URL),
+            InlineKeyboardButton("📌 Pinterest", url=PINTEREST_URL),
+        ],
+        [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
+    ])
 
 def get_shop_categories_keyboard():
     keyboard = [
@@ -995,38 +1272,50 @@ def get_shop_categories_keyboard():
         [InlineKeyboardButton("✈️ ASA Pilot Manuals & Guides", callback_data="cat_asa_pilot")],
         [InlineKeyboardButton("📖 Essential Aviation Books", callback_data="cat_aviation_books")],
         [InlineKeyboardButton("🛒 View Shopping Cart", callback_data="view_cart")],
+        [InlineKeyboardButton("📋 Order History", callback_data="view_orders")],
         [InlineKeyboardButton("🌐 Connect on Social Media", callback_data="socials_menu")],
         [InlineKeyboardButton("💡 Suggestions & Book Requests", callback_data="suggestions_menu")],
-        [InlineKeyboardButton("⭐ Support & Contribute to ATPL Edge", callback_data="donate_menu")],
+        [InlineKeyboardButton("⭐ Support & Contribute", callback_data="donate_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 # ---------------------------------------------------------
-# 4. Core Bot Handlers & Startup Setup
+# Core Handlers
 # ---------------------------------------------------------
 async def post_init(application):
     await application.bot.delete_my_commands()
     
     commands = [
-        BotCommand("start", "Launch the ATPL Edge Bot & Main Menu"),
-        BotCommand("shop", "Browse Professional Aviation Catalog"),
-        BotCommand("cart", "View your active shopping cart"),
-        BotCommand("socials", "Follow us on social media platforms"),
-        BotCommand("donate", "Support bot development with Telegram Stars"),
-        BotCommand("help", "Contact support and assistance"),
+        BotCommand("start", "🚀 Launch the bot"),
+        BotCommand("shop", "🛒 Browse catalog"),
+        BotCommand("cart", "🛒 View cart"),
+        BotCommand("orders", "📋 Order history"),
+        BotCommand("socials", "🌐 Social media"),
+        BotCommand("donate", "⭐ Support development"),
+        BotCommand("help", "❓ Get help"),
     ]
     await application.bot.set_my_commands(commands)
+    
+    load_order_history()
+    
+    if hasattr(application, 'job_queue') and application.job_queue:
+        application.job_queue.run_repeating(
+            check_cart_expiry,
+            interval=3600,
+            first=10
+        )
+        logger.info("Cart expiry check scheduled")
 
 async def check_terms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     if user_id not in user_agreed_terms:
         terms_text = (
-            "⚖️ **Terms and Conditions**\n\n"
-            "Welcome to ATPL Edge Store. Before accessing our professional aviation materials, training manuals, and services, you must review and accept our terms:\n\n"
-            "1. All digital materials, books, and videos provided are for personal educational and training use only.\n"
-            "2. Redistribution, unauthorized copying, or commercial resale of purchased content is strictly prohibited.\n"
-            "3. Payments made via Telegram Stars are final and non-refundable once content is delivered.\n\n"
-            "Please click the button below to accept our terms and enter the store:"
+            "⚖️ *TERMS AND CONDITIONS*\n\n"
+            "Welcome to ATPL Edge Store. Before accessing our materials, you must accept our terms:\n\n"
+            "1️⃣ All digital materials are for personal educational use only.\n"
+            "2️⃣ Redistribution or commercial resale is strictly prohibited.\n"
+            "3️⃣ Payments are final and non-refundable once content is delivered.\n\n"
+            "Click the button below to accept:"
         )
         if update.callback_query and update.callback_query.message:
             await update.callback_query.message.reply_text(terms_text, parse_mode="Markdown", reply_markup=get_terms_keyboard())
@@ -1041,9 +1330,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_name = update.effective_user.first_name
     welcome_msg = (
-        f"Welcome aboard, Captain {user_name}! 👨‍✈️✈️\n\n"
-        "Welcome to **ATPL Edge Store**, your ultimate destination for professional aviation training materials, EASA/FAA manuals, and pilot guides.\n\n"
-        "Please select from our primary options below to get started:"
+        f"👨‍✈️ *Welcome aboard, Captain {user_name}!*\n\n"
+        "✈️ Welcome to *ATPL Edge Store*, your destination for professional aviation training materials.\n\n"
+        "📚 Select from the options below:"
     )
     if update.message:
         await update.message.reply_text(welcome_msg, parse_mode="Markdown", reply_markup=get_shop_categories_keyboard())
@@ -1052,13 +1341,8 @@ async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_terms(update, context):
         return
 
-    shop_text = (
-        "🛒 **ATPL Edge Store Catalog**\n\n"
-        "Explore our comprehensive library of professional aviation manuals and training series. Select a category below:"
-    )
-    await update.message.reply_text(
-        shop_text, parse_mode="Markdown", reply_markup=get_shop_categories_keyboard()
-    )
+    shop_text = "🛒 *ATPL Edge Store Catalog*\n\n📚 Explore our library of aviation manuals. Select a category:"
+    await update.message.reply_text(shop_text, parse_mode="Markdown", reply_markup=get_shop_categories_keyboard())
 
 async def cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_terms(update, context):
@@ -1071,10 +1355,7 @@ async def socials_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_terms(update, context):
         return
 
-    text = (
-        "🌐 **Find us on the following platforms:**\n\n"
-        "We are excited to have you join our aviation community and stay updated through our official channels below:"
-    )
+    text = "🌐 *Find us on the following platforms:*"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_socials_keyboard())
 
 async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1088,19 +1369,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     help_text = (
-        "✈️ **ATPL Edge Support Center**\n\n"
-        "We are dedicated to assisting you throughout your aviation training journey. For any support, inquiries, or book requests, please reach out to us via email or WhatsApp below:\n\n"
-        "📧 **Official Email Support:**\n"
-        f"`{STORE_EMAIL}`"
+        "✈️ *ATPL Edge Support Center*\n\n"
+        "📧 For support, inquiries, or book requests:\n\n"
+        f"📧 *Email:* {STORE_EMAIL}"
     )
-    await update.message.reply_text(
-        help_text, parse_mode="Markdown", reply_markup=get_whatsapp_keyboard()
-    )
+    await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_whatsapp_keyboard())
 
 async def show_donation_menu(message_obj, is_new_message=False, is_callback=True):
     text = (
-        "⭐ **Support ATPL Edge Development**\n\n"
-        "If our resources and tools contribute to your aviation studies, you can support ongoing platform maintenance and feature updates using Telegram Stars below. Thank you for your continued encouragement! 💙"
+        "⭐ *Support ATPL Edge Development*\n\n"
+        "💙 Support ongoing platform maintenance using Telegram Stars:"
     )
     
     stars_999 = int(9.99 * STARS_PER_USD)
@@ -1108,40 +1386,28 @@ async def show_donation_menu(message_obj, is_new_message=False, is_callback=True
     stars_4999 = int(49.99 * STARS_PER_USD)
     stars_9999 = int(99.99 * STARS_PER_USD)
 
-    keyboard = InlineKeyboardMarkup(
+    keyboard = InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton(f"⭐ Support $9.99 (⭐ {stars_999})", callback_data="donate_9.99"),
-                InlineKeyboardButton(f"⭐ Support $19.99 (⭐ {stars_1999})", callback_data="donate_19.99"),
-            ],
-            [
-                InlineKeyboardButton(f"⭐ Support $49.99 (⭐ {stars_4999})", callback_data="donate_49.99"),
-                InlineKeyboardButton(f"⭐ Support $99.99 (⭐ {stars_9999})", callback_data="donate_99.99"),
-            ],
-            [
-                InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories"),
-            ]
-        ]
-    )
+            InlineKeyboardButton(f"⭐ $9.99 ({stars_999} Stars)", callback_data="donate_9.99"),
+            InlineKeyboardButton(f"⭐ $19.99 ({stars_1999} Stars)", callback_data="donate_19.99"),
+        ],
+        [
+            InlineKeyboardButton(f"⭐ $49.99 ({stars_4999} Stars)", callback_data="donate_49.99"),
+            InlineKeyboardButton(f"⭐ $99.99 ({stars_9999} Stars)", callback_data="donate_99.99"),
+        ],
+        [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")],
+    ])
     
     try:
         if is_new_message:
-            if is_callback and hasattr(message_obj, "photo") and message_obj.photo:
-                await message_obj.delete()
-                await message_obj.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
-            else:
-                await message_obj.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+            await message_obj.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
         else:
-            if hasattr(message_obj, "photo") and message_obj.photo:
-                await message_obj.delete()
-                await message_obj.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
-            else:
-                await message_obj.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+            await message_obj.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Error in show_donation_menu: {e}")
 
 # ---------------------------------------------------------
-# 5. Button Callback Handling & Single Control Panel UI
+# Callback Handler
 # ---------------------------------------------------------
 async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1151,91 +1417,106 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     data = query.data
 
+    try:
+        await query.message.delete()
+    except:
+        pass
+
     if data == "agree_terms":
         user_agreed_terms.add(user_id)
-        text = "✅ **Terms Accepted Successfully!**\n\nWelcome to ATPL Edge Store. Please select from our primary options below:"
+        text = "✅ *Terms Accepted!*\n\n👨‍✈️ Welcome to ATPL Edge Store. Select from the options below:"
         markup = get_shop_categories_keyboard()
-        if query.message.photo:
-            await query.message.delete()
-            sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
-            user_cart_messages[user_id] = sent.message_id
-        else:
-            try:
-                await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = query.message.message_id
-            except Exception:
-                sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = sent.message_id
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
+        user_cart_messages[user_id] = sent.message_id
         return
 
     if data != "agree_terms" and not await check_terms(update, context):
         return
 
-    # تنظيف السلال القديمة
     cleanup_old_carts()
 
     if data == "back_to_categories":
-        text = "🛒 **ATPL Edge Store Catalog**\n\nPlease select a category below:"
+        text = "🛒 *ATPL Edge Store Catalog*\n\n📚 Select a category:"
         markup = get_shop_categories_keyboard()
-        if query.message.photo:
-            await query.message.delete()
-            sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
-            user_cart_messages[user_id] = sent.message_id
-        else:
-            try:
-                await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = query.message.message_id
-            except Exception:
-                sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = sent.message_id
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
+        user_cart_messages[user_id] = sent.message_id
         return
 
     elif data == "socials_menu":
-        text = (
-            "🌐 **Find us on the following platforms:**\n\n"
-            "We are excited to have you join our aviation community and stay updated through our official channels below:"
-        )
+        text = "🌐 *Find us on the following platforms:*"
         markup = get_socials_keyboard()
-        if query.message.photo:
-            await query.message.delete()
-            sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=markup)
-            user_cart_messages[user_id] = sent.message_id
-        else:
-            try:
-                await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = query.message.message_id
-            except Exception:
-                sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = sent.message_id
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
+        user_cart_messages[user_id] = sent.message_id
         return
 
     elif data == "suggestions_menu":
         text = (
-            "💡 **Suggestions & Book Requests**\n\n"
-            "We always strive to improve our services and provide any manual you need.\n\n"
-            "For suggestions or book requests, please contact us exclusively through:\n\n"
-            f"📧 **Email:** `{STORE_EMAIL}`"
+            "💡 *Suggestions & Book Requests*\n\n"
+            "📧 For suggestions or book requests:\n\n"
+            f"📧 *Email:* {STORE_EMAIL}"
         )
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("💬 Contact via WhatsApp", url=WHATSAPP_URL)],
             [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
         ])
-        
-        if query.message.photo:
-            await query.message.delete()
-            sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=markup)
-            user_cart_messages[user_id] = sent.message_id
-        else:
-            try:
-                await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = query.message.message_id
-            except Exception:
-                sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = sent.message_id
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
+        user_cart_messages[user_id] = sent.message_id
         return
 
     elif data == "donate_menu":
-        await show_donation_menu(query.message, is_new_message=False, is_callback=True)
+        text = (
+            "⭐ *Support ATPL Edge Development*\n\n"
+            "💙 Support ongoing platform maintenance using Telegram Stars:"
+        )
+        
+        stars_999 = int(9.99 * STARS_PER_USD)
+        stars_1999 = int(19.99 * STARS_PER_USD)
+        stars_4999 = int(49.99 * STARS_PER_USD)
+        stars_9999 = int(99.99 * STARS_PER_USD)
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"⭐ $9.99 ({stars_999} Stars)", callback_data="donate_9.99"),
+                InlineKeyboardButton(f"⭐ $19.99 ({stars_1999} Stars)", callback_data="donate_19.99"),
+            ],
+            [
+                InlineKeyboardButton(f"⭐ $49.99 ({stars_4999} Stars)", callback_data="donate_49.99"),
+                InlineKeyboardButton(f"⭐ $99.99 ({stars_9999} Stars)", callback_data="donate_99.99"),
+            ],
+            [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")],
+        ])
+        
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="Markdown")
+        user_cart_messages[user_id] = sent.message_id
+        return
+
+    elif data == "view_orders":
+        user_orders = [o for o in completed_orders.values() if o.get('user_id') == user_id]
+        
+        if not user_orders:
+            text = "📋 *No Previous Orders Found*\n\nYou don't have any previous orders yet."
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
+            ])
+            sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown")
+            user_cart_messages[user_id] = sent.message_id
+        else:
+            history_text = f"📋 *YOUR ORDER HISTORY* ({len(user_orders)} orders):\n\n"
+            for i, order in enumerate(user_orders[-10:], 1):
+                history_text += f"""
+━━━━━━━━━━━━━━━━━━━━━
+📦 *Order {i}:*
+🆔 ID: `{order.get('order_id', 'N/A')}`
+📅 Date: {order.get('date', 'N/A')} {order.get('time', '')}
+💰 Amount: ${order.get('total_usd', 0):.2f}
+📚 Items: {len(order.get('items', []))} items
+━━━━━━━━━━━━━━━━━━━━━
+"""
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
+            ])
+            sent = await context.bot.send_message(chat_id=chat_id, text=history_text, reply_markup=markup, parse_mode="Markdown")
+            user_cart_messages[user_id] = sent.message_id
         return
 
     elif data.startswith("donate_"):
@@ -1256,9 +1537,9 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id in user_carts and 0 <= item_index < len(user_carts[user_id]):
                 removed_item = user_carts[user_id].pop(item_index)
                 update_cart_timestamp(user_id)
-                await query.answer(f"Removed: {removed_item['title']}", show_alert=False)
+                await query.answer(f"🗑️ Removed: {removed_item['title']}", show_alert=False)
         except Exception as e:
-            logger.error(f"Error removing item from cart: {e}")
+            logger.error(f"Error removing item: {e}")
 
         await show_or_update_active_cart(chat_id, user_id, context, query.message)
         return
@@ -1275,47 +1556,27 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if price_usd == 0.0:
                     buttons.append([InlineKeyboardButton(f"📖 {book['title']} (FREE)", callback_data=f"show_book_{book_id}")])
                 else:
-                    buttons.append([InlineKeyboardButton(f"📖 {book['title']} (${price_usd} / ⭐ {stars_val})", callback_data=f"show_book_{book_id}")])
+                    buttons.append([InlineKeyboardButton(f"📖 {book['title']} (${price_usd})", callback_data=f"show_book_{book_id}")])
 
         if buttons:
-            buttons.append([InlineKeyboardButton("🔙 Return to Categories", callback_data="back_to_categories")])
+            buttons.append([InlineKeyboardButton("⬅️ Return to Categories", callback_data="back_to_categories")])
             reply_markup = InlineKeyboardMarkup(buttons)
 
-            header_note = f"📚 **{category_name}**\n\nSelect any publication below to inspect details and options:"
+            header_note = f"{category_name}\n\n📚 Select any publication to view details:"
             if data == "cat_free_books":
-                header_note += "\n\n🎁 *Note: All books in this section are 100% FREE with zero fees!*"
+                header_note += "\n\n🎁 *All books in this section are 100% FREE!*"
             elif data == "cat_cae_2020":
-                header_note += "\n\n💡 *Note: Individual manuals are $12.99 each, or acquire the complete bundle for $169.99!*"
+                header_note += "\n\n💡 *Individual manuals are $12.99 each, or get the complete bundle for $169.99!*"
             elif data == "cat_cae_2014":
-                header_note += "\n\n💡 *Note: All items in this collection are fixed at a flat price of $5.99 each!*"
+                header_note += "\n\n💡 *All items are $5.99 each!*"
             elif data == "cat_faa_books":
-                header_note += "\n\n💡 *Note: All official FAA manuals are fixed at $14.99 each!*"
+                header_note += "\n\n💡 *All FAA manuals are $14.99 each!*"
+            elif data == "cat_aviation_books":
+                header_note += "\n\n💡 *Essential aviation reference books!*"
 
-            if query.message.photo:
-                await query.message.delete()
-                sent = await context.bot.send_message(chat_id=chat_id, text=header_note, reply_markup=reply_markup, parse_mode="Markdown")
-                user_cart_messages[user_id] = sent.message_id
-            else:
-                try:
-                    await query.message.edit_text(header_note, reply_markup=reply_markup, parse_mode="Markdown")
-                    user_cart_messages[user_id] = query.message.message_id
-                except Exception:
-                    sent = await context.bot.send_message(chat_id=chat_id, text=header_note, reply_markup=reply_markup, parse_mode="Markdown")
-                    user_cart_messages[user_id] = sent.message_id
-        else:
-            text = "ℹ️ No items available in this section currently."
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Return to Categories", callback_data="back_to_categories")]])
-            if query.message.photo:
-                await query.message.delete()
-                sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
-                user_cart_messages[user_id] = sent.message_id
-            else:
-                try:
-                    await query.message.edit_text(text, reply_markup=markup)
-                    user_cart_messages[user_id] = query.message.message_id
-                except Exception:
-                    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
-                    user_cart_messages[user_id] = sent.message_id
+            sent = await context.bot.send_message(chat_id=chat_id, text=header_note, reply_markup=reply_markup, parse_mode="Markdown")
+            user_cart_messages[user_id] = sent.message_id
+        return
 
     elif data.startswith("show_book_"):
         book_id = data.replace("show_book_", "")
@@ -1326,29 +1587,22 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stars_val = int(price_usd * STARS_PER_USD)
             
             if price_usd == 0.0:
-                price_display = "🎁 **FREE (0.00$)**"
+                price_display = "🎁 FREE"
             else:
-                price_display = f"💵 **Price:** ${price_usd:.2f}  |  ⭐ **Stars:** {stars_val}"
+                price_display = f"💵 ${price_usd:.2f} | ⭐ {stars_val} Stars"
 
             caption_text = (
-                f"📑 **Category:** {book['category_name']}\n\n"
-                f"📖 **Title:**\n{book['title']}\n\n"
-                f"📝 **Overview:**\n{book['details']}\n\n"
-                f"{price_display}"
+                f"{book['category_name']}\n\n"
+                f"📖 *Title:*\n{book['title']}\n\n"
+                f"📝 *Overview:*\n{book['details']}\n\n"
+                f"💰 *Price:* {price_display}"
             )
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("🛒 Add to Shopping Cart", callback_data=f"buy_{book_id}")],
-                    [InlineKeyboardButton("🔙 Back to Catalog List", callback_data=book["category_id"])],
-                    [InlineKeyboardButton("🏠 Main Store Menu", callback_data="back_to_categories")],
-                ]
-            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛒 Add to Shopping Cart", callback_data=f"buy_{book_id}")],
+                [InlineKeyboardButton("⬅️ Back to Catalog", callback_data=book["category_id"])],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_categories")],
+            ])
             
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-
             try:
                 sent_photo = await context.bot.send_photo(
                     chat_id=chat_id,
@@ -1360,12 +1614,13 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_cart_messages[user_id] = sent_photo.message_id
             except Exception as e:
                 logger.error(f"Error sending photo: {e}")
-                await context.bot.send_message(
+                sent = await context.bot.send_message(
                     chat_id=chat_id,
                     text=caption_text,
                     parse_mode="Markdown",
                     reply_markup=keyboard
                 )
+                user_cart_messages[user_id] = sent.message_id
 
     elif data.startswith("buy_"):
         book_id = data.replace("buy_", "")
@@ -1378,9 +1633,9 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_cart_timestamp(user_id)
         
         if book.get("price_usd", 0.0) == 0.0:
-            await query.answer(f"Added Free Book: {book['title'][:20]}...", show_alert=False)
+            await query.answer(f"🎁 Added Free Book: {book['title'][:20]}...")
         else:
-            await query.answer(f"Added: {book['title'][:20]}...", show_alert=False)
+            await query.answer(f"🛒 Added: {book['title'][:20]}...")
 
         await show_or_update_active_cart(chat_id, user_id, context, query.message)
 
@@ -1394,27 +1649,22 @@ def generate_cart_content(user_id):
     cart_items = user_carts.get(user_id, [])
 
     if not cart_items:
-        text = "🛒 **Your shopping cart is currently empty.**\nUse the buttons below to browse our professional aviation catalog."
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Return to Store Catalog", callback_data="back_to_categories")]])
+        text = "🛒 *Your shopping cart is empty.*\n\n📚 Browse our catalog to add items."
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Return to Catalog", callback_data="back_to_categories")]])
         return text, keyboard
 
-    text = "🛒 **Your Active Shopping Cart:**\n\n"
+    text = "🛒 *YOUR SHOPPING CART:*\n\n"
     total_price_usd = 0.0
     keyboard_rows = []
-
-    has_paid_items = False
-    has_free_items = False
 
     for idx, item in enumerate(cart_items):
         price_usd = item.get("price_usd", 12.99)
         if price_usd > 0.0:
-            has_paid_items = True
             total_price_usd += price_usd
             stars_val = int(price_usd * STARS_PER_USD)
-            text += f"{idx + 1}. *{item['title']}* — (${price_usd:.2f} / ⭐ {stars_val})\n"
+            text += f"{idx + 1}. 📖 {item['title']} - (💵 ${price_usd:.2f} / ⭐ {stars_val} Stars)\n"
         else:
-            has_free_items = True
-            text += f"{idx + 1}. *{item['title']}* — (🎁 **FREE**) [Free items carry 0.00 fee]\n"
+            text += f"{idx + 1}. 📖 {item['title']} - (🎁 FREE)\n"
         
         keyboard_rows.append([
             InlineKeyboardButton(f"🗑️ Remove: {item['title'][:25]}...", callback_data=f"remove_cart_{idx}")
@@ -1428,23 +1678,23 @@ def generate_cart_content(user_id):
 
     total_stars = int(final_price_usd * STARS_PER_USD)
 
-    if has_free_items and has_paid_items:
-        text += "\nℹ️ *Note: Free books are valued at $0.00 and excluded from financial billing.*"
-
-    text += f"\n📊 **Subtotal (Paid Items):** ${total_price_usd:.2f}"
+    text += f"\n📊 *Subtotal:* ${total_price_usd:.2f}"
     if discount_applied:
-        text += f"\n🔥 **10% Special Discount Applied!** (Orders >= $50)"
-        text += f"\n💳 **Final Total Amount:** **${final_price_usd:.2f}**  (⭐ **{total_stars} Stars**)\n\n"
+        text += f"\n🔥 *10% Discount Applied!*"
+        text += f"\n💳 *Final Total:* ${final_price_usd:.2f} (⭐ {total_stars} Stars)\n\n"
     else:
-        text += f"\n💳 **Total Cart Amount:** **${final_price_usd:.2f}**  (⭐ **{total_stars} Stars**)\n\n"
+        text += f"\n💳 *Total:* ${final_price_usd:.2f} (⭐ {total_stars} Stars)\n\n"
+
+    hours, minutes = get_cart_remaining_time(user_id)
+    text += f"⏰ *Cart expires in:* {hours}h {minutes}m\n\n"
 
     if total_stars > 0:
-        text += "Select your preferred payment method below to complete the order:"
-        keyboard_rows.append([InlineKeyboardButton(f"⭐ Pay {total_stars} Stars Securely", callback_data="checkout_telegram_stars")])
-        keyboard_rows.append([InlineKeyboardButton("💬 Confirm Payment via WhatsApp", url=WHATSAPP_URL)])
+        text += "💳 *Select payment method:*"
+        keyboard_rows.append([InlineKeyboardButton(f"⭐ Pay {total_stars} Stars", callback_data="checkout_telegram_stars")])
+        keyboard_rows.append([InlineKeyboardButton("💬 Confirm via WhatsApp", url=WHATSAPP_URL)])
     else:
-        text += "Your cart contains only free items! Click below to claim your free materials instantly:"
-        keyboard_rows.append([InlineKeyboardButton("📥 Claim Free Books Instantly", callback_data="checkout_telegram_stars")])
+        text += "🎁 *Claim your free materials:*"
+        keyboard_rows.append([InlineKeyboardButton("📥 Claim Free Books", callback_data="checkout_telegram_stars")])
 
     keyboard_rows.append([InlineKeyboardButton("⬅️ Continue Shopping", callback_data="back_to_categories")])
 
@@ -1454,58 +1704,29 @@ def generate_cart_content(user_id):
 async def show_or_update_active_cart(chat_id, user_id, context, message_obj):
     text, keyboard = generate_cart_content(user_id)
     
-    if hasattr(message_obj, "photo") and message_obj.photo:
-        try:
-            await message_obj.delete()
-        except Exception:
-            pass
-        sent_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        user_cart_messages[user_id] = sent_msg.message_id
-        return
-
-    existing_message_id = user_cart_messages.get(user_id)
-
-    if existing_message_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=existing_message_id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=keyboard
-            )
-            return
-        except Exception:
-            pass
-
     try:
-        await message_obj.edit_text(
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        user_cart_messages[user_id] = message_obj.message_id
-    except Exception:
-        sent_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        user_cart_messages[user_id] = sent_msg.message_id
+        if hasattr(message_obj, 'photo') and message_obj.photo:
+            await message_obj.delete()
+        else:
+            await message_obj.delete()
+    except:
+        pass
+    
+    sent_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    user_cart_messages[user_id] = sent_msg.message_id
 
 # ---------------------------------------------------------
-# 6. Telegram Stars Payment & Checkout Integration
+# Payment Handlers
 # ---------------------------------------------------------
 async def start_telegram_stars_checkout(query, user_id, context):
     cart_items = user_carts.get(user_id, [])
     if not cart_items:
-        await query.message.reply_text("Your shopping cart is empty!")
+        await query.message.reply_text("🛒 Your cart is empty!")
         return
 
     total_price_usd = 0.0
@@ -1519,28 +1740,88 @@ async def start_telegram_stars_checkout(query, user_id, context):
 
     if total_stars == 0:
         try:
+            order_data = {
+                'user_id': user_id,
+                'user_name': query.from_user.username or 'Unknown',
+                'full_name': f"{query.from_user.first_name} {query.from_user.last_name or ''}".strip(),
+                'items': cart_items,
+                'total_usd': 0.0,
+                'total_stars': 0,
+                'charge_id': 'FREE_ITEMS',
+                'date': datetime.now().strftime("%Y-%m-%d"),
+                'time': datetime.now().strftime("%H:%M:%S"),
+                'discount_applied': False,
+                'total_items': len(cart_items),
+                'free_items': len(cart_items),
+                'paid_items': 0,
+            }
+            
+            order_id = await send_admin_notification(context, order_data, is_free_items=True)
+            
+            now = datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            time_str = now.strftime("%H:%M:%S")
+            
+            items_list = "\n".join([f"📚 {i+1}. {item['title']}" for i, item in enumerate(cart_items)])
+            
+            receipt_message = f"""
+🎁 *FREE MATERIALS CLAIMED!*
+
+━━━━━━━━━━━━━━━━━━━━━
+📋 *RECEIPT DETAILS:*
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Order ID: `{order_id}`
+📅 Date: {date_str}
+⏰ Time: {time_str} UTC
+
+━━━━━━━━━━━━━━━━━━━━━
+📚 *CLAIMED ITEMS:*
+━━━━━━━━━━━━━━━━━━━━━
+{items_list}
+
+━━━━━━━━━━━━━━━━━━━━━
+💰 *PAYMENT:*
+━━━━━━━━━━━━━━━━━━━━━
+💵 Total: $0.00 (FREE)
+⭐ Stars: 0
+
+━━━━━━━━━━━━━━━━━━━━━
+⚠️ *IMPORTANT NOTE:*
+━━━━━━━━━━━━━━━━━━━━━
+📌 Please keep this receipt until all downloads are complete.
+
+📧 Use this receipt as reference when contacting support for any issues.
+━━━━━━━━━━━━━━━━━━━━━
+"""
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_categories")],
+            ])
+            
             await query.message.reply_text(
-                "🎁 **Free Materials Claimed Successfully!** 🎉\n"
-                "Dispatching your free aviation documents directly to your chat...",
-                parse_mode="Markdown"
+                receipt_message,
+                parse_mode="Markdown",
+                reply_markup=keyboard
             )
+            
             for item in cart_items:
                 delivery_text = (
-                    f"📥 **Your free document is ready for download:**\n\n"
-                    f"📖 {item['title']}\n\n"
-                    f"🔗 **Secure Direct Download Link:** {item['file_url']}"
+                    f"📥 *{item['title']}*\n\n"
+                    f"🔗 *Download:* {item['file_url']}"
                 )
                 await query.message.reply_text(delivery_text, parse_mode="Markdown")
 
             user_carts[user_id] = []
             user_cart_messages.pop(user_id, None)
             user_cart_timestamps.pop(user_id, None)
+            cart_creation_notified.discard(user_id)
         except Exception as e:
             logger.error(f"Error delivering free items: {e}")
         return
 
-    title = "ATPL Edge Store Digital Order"
-    description = f"Purchase of {len(cart_items)} professional aviation manual(s)."
+    title = "ATPL Edge Store Order"
+    description = f"Purchase of {len(cart_items)} aviation manual(s)."
     payload = f"atpl_edge_stars_order_{user_id}_{int(time.time())}"
     currency = "XTR"
 
@@ -1553,20 +1834,17 @@ async def start_telegram_stars_checkout(query, user_id, context):
             title=title,
             description=description,
             payload=payload,
-            provider_token="",  
+            provider_token="",
             currency=currency,
             prices=prices,
             start_parameter="stars-payment",
         )
     except Exception as e:
         logger.error(f"Error sending invoice: {e}")
-        await query.message.reply_text(
-            "❌ An error occurred while processing your payment. Please try again later.",
-            parse_mode="Markdown"
-        )
+        await query.message.reply_text("❌ An error occurred. Please try again.", parse_mode="Markdown")
 
 async def start_telegram_donation_checkout(query, user_id, context, usd_amount, stars_amount, title):
-    description = f"Supporting ATPL Edge platform development with ${usd_amount} contribution."
+    description = f"Supporting ATPL Edge with ${usd_amount} contribution."
     payload = f"atpl_edge_donation_{user_id}_{int(time.time())}"
     currency = "XTR"
 
@@ -1586,10 +1864,7 @@ async def start_telegram_donation_checkout(query, user_id, context, usd_amount, 
         )
     except Exception as e:
         logger.error(f"Error sending donation invoice: {e}")
-        await query.message.reply_text(
-            "❌ An error occurred while processing your donation. Please try again later.",
-            parse_mode="Markdown"
-        )
+        await query.message.reply_text("❌ An error occurred. Please try again.", parse_mode="Markdown")
 
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
@@ -1603,59 +1878,133 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         payload = payment_info.invoice_payload
 
         if "donation" in payload:
+            donation_notification = f"""
+💰 *NEW DONATION!*
+
+👤 User: `{user_id}`
+📝 Username: @{update.effective_user.username or 'Unknown'}
+⭐ Stars: {payment_info.total_amount}
+📅 Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=donation_notification,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send donation notification to admin: {e}")
+            
             await update.message.reply_text(
-                "⭐ **Thank you immensely for your generous support!** 🎉💙\n"
-                f"Stars Contributed: **{payment_info.total_amount} Stars**\n"
-                "Your contribution empowers us to expand our aviation library and improve platform tools.",
-                parse_mode="Markdown"
+                "⭐ *THANK YOU FOR YOUR SUPPORT!*\n\n"
+                "💙 Your contribution helps us expand our library.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_categories")]
+                ])
             )
             return
 
         cart_items = user_carts.get(user_id, [])
-        purchased_titles = [item['title'] for item in cart_items]
+        if not cart_items:
+            await update.message.reply_text("❌ No items in cart")
+            return
         
         total_price_usd = sum(item.get("price_usd", 0.0) for item in cart_items)
+        discount_applied = False
         if total_price_usd >= 50.0:
             total_price_usd *= 0.90
+            discount_applied = True
 
-        purchase_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        purchase_time = datetime.now()
+        
+        order_data = {
+            'user_id': user_id,
+            'user_name': update.effective_user.username or 'Unknown',
+            'full_name': f"{update.effective_user.first_name} {update.effective_user.last_name or ''}".strip(),
+            'items': cart_items,
+            'total_usd': total_price_usd,
+            'total_stars': payment_info.total_amount,
+            'charge_id': payment_info.provider_payment_charge_id,
+            'date': purchase_time.strftime("%Y-%m-%d"),
+            'time': purchase_time.strftime("%H:%M:%S"),
+            'discount_applied': discount_applied,
+            'total_items': len(cart_items),
+            'free_items': sum(1 for item in cart_items if item.get('price_usd', 0) == 0),
+            'paid_items': sum(1 for item in cart_items if item.get('price_usd', 0) > 0),
+        }
+        
+        order_id = await send_admin_notification(context, order_data)
+        
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M:%S")
+        
+        items_list = "\n".join([f"📚 {i+1}. {item['title']}" for i, item in enumerate(cart_items)])
+        
+        receipt_message = f"""
+✅ *PAYMENT CONFIRMED!*
 
-        admin_report = (
-            f"🚨 **Admin Audit Report: New Purchase**\n\n"
-            f"👤 **Account ID:** `{user_id}`\n"
-            f"📚 **Purchased Books:**\n" + "\n".join([f"- {t}" for t in purchased_titles]) + f"\n\n"
-            f"💵 **Total Value (USD):** `${total_price_usd:.2f}`\n"
-            f"⭐ **Total Stars Paid:** `{payment_info.total_amount} Stars`\n"
-            f"⏰ **Date & Time:** `{purchase_time}`\n"
-            f"💳 **Charge ID:** `{payment_info.provider_payment_charge_id}`"
-        )
-        try:
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_report, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Failed to send admin audit report: {e}")
+━━━━━━━━━━━━━━━━━━━━━
+📋 *RECEIPT DETAILS:*
+━━━━━━━━━━━━━━━━━━━━━
 
+🆔 Order ID: `{order_id}`
+📅 Date: {date_str}
+⏰ Time: {time_str} UTC
+
+━━━━━━━━━━━━━━━━━━━━━
+📚 *PURCHASED ITEMS:*
+━━━━━━━━━━━━━━━━━━━━━
+{items_list}
+
+━━━━━━━━━━━━━━━━━━━━━
+💰 *PAYMENT:*
+━━━━━━━━━━━━━━━━━━━━━
+💵 Total (USD): ${total_price_usd:.2f}
+⭐ Stars Paid: {payment_info.total_amount} Stars
+"""
+
+        if discount_applied:
+            receipt_message += "\n🔥 *10% Discount Applied*\n"
+        
+        receipt_message += """
+━━━━━━━━━━━━━━━━━━━━━
+⚠️ *IMPORTANT NOTE:*
+━━━━━━━━━━━━━━━━━━━━━
+📌 Please keep this receipt until all downloads are complete.
+
+📧 Use this receipt as reference when contacting support for any issues.
+
+💬 Contact: Atpledgestore@Gmail.com
+━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_categories")],
+            [InlineKeyboardButton("🛒 Continue Shopping", callback_data="back_to_categories")],
+        ])
+        
         await update.message.reply_text(
-            "⭐ **Payment Verified & Confirmed Successfully!** 🎉\n"
-            f"Stars Paid: **{payment_info.total_amount} Stars**\n"
-            f"Transaction Reference: `{payment_info.provider_payment_charge_id}`\n\n"
-            "Dispatching all ordered files (including any requested free manuals) directly to your chat...",
-            parse_mode="Markdown"
+            receipt_message,
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
-
+        
         for item in cart_items:
             delivery_text = (
-                f"📥 **Your item is ready for download:**\n\n"
-                f"📖 {item['title']}\n\n"
-                f"🔗 **Secure Direct Download Link:** {item['file_url']}"
+                f"📥 *{item['title']}*\n\n"
+                f"🔗 *Download:* {item['file_url']}"
             )
             await update.message.reply_text(delivery_text, parse_mode="Markdown")
-
+        
         user_carts[user_id] = []
         user_cart_messages.pop(user_id, None)
         user_cart_timestamps.pop(user_id, None)
+        cart_creation_notified.discard(user_id)
 
 # ---------------------------------------------------------
-# 7. File ID Extractor (Admin Only: 869423522)
+# File ID Extractor
 # ---------------------------------------------------------
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1679,18 +2028,17 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if file_id:
         response_text = (
-            f"📸 **File ID Extracted Successfully (Admin Panel)**\n\n"
+            f"📸 *FILE ID EXTRACTED*\n\n"
             f"Type: `{file_type}`\n\n"
-            f"🆔 **File ID:**\n`{file_id}`\n\n"
-            "*(Copy this ID and use it directly as the `cover_url` or `file_url` in your books database)*"
+            f"🆔 *File ID:*\n`{file_id}`\n\n"
+            f"*(Use this ID as cover_url or file_url in database)*"
         )
         await message.reply_text(response_text, parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# 8. Main Application Runner
+# Main Application
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    # إنشاء التطبيق
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     application = (
         ApplicationBuilder()
@@ -1700,28 +2048,25 @@ if __name__ == "__main__":
         .build()
     )
 
-    # Command Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("shop", shop_command))
     application.add_handler(CommandHandler("cart", cart_command))
+    application.add_handler(CommandHandler("orders", orders_history_command))
+    application.add_handler(CommandHandler("sales", sales_report_command))
     application.add_handler(CommandHandler("socials", socials_command))
     application.add_handler(CommandHandler("donate", donate_command))
     application.add_handler(CommandHandler("help", help_command))
-
-    # Callback & Payment Handlers
+    
     application.add_handler(CallbackQueryHandler(shop_callback))
     application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-
-    # File & Cover ID extractor Handler (Admin Only)
+    
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO, handle_incoming_file))
 
-    print("🤖 ATPL Edge Bot is up and running...")
+    print("🤖 ATPL Edge Bot is running...")
     
-    # تشغيل الخادم الوهمي
     keep_alive()
     
-    # تشغيل البوت
     try:
         application.run_polling()
     except Exception as e:
