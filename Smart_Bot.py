@@ -2076,10 +2076,9 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(response_text, parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# Main Application
+# Main Application - Webhook Mode
 # ---------------------------------------------------------
-async def main():
-    """Main async function"""
+if __name__ == "__main__":
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     application = (
         ApplicationBuilder()
@@ -2108,17 +2107,16 @@ async def main():
 
     print("🤖 ATPL Edge Bot is running...")
     
-    # تشغيل Flask في خيط منفصل
-    keep_alive()
+    # استخدام Webhook بدلاً من Polling
+    PORT = int(os.environ.get("PORT", 10000))
     
-    # تشغيل البوت - بدون إغلاق loop يدوي
-    await application.run_polling()
-
-if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Bot stopped by user")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'your-app.onrender.com')}/webhook"
+        )
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
         raise
