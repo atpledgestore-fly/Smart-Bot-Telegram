@@ -98,6 +98,7 @@ cart_creation_notified = set()
 CART_EXPIRY_HOURS = 24
 BACKUP_FILE = "orders_backup.json"
 
+
 # ---------------------------------------------------------
 # Backup System
 # ---------------------------------------------------------
@@ -225,7 +226,6 @@ async def send_admin_notification(context, order_data, is_free_items=False):
     order_history[order_id] = order_data
     save_order_backup(order_data)
     
-    # 1. Send to private channel
     channel_sent = False
     try:
         await context.bot.send_message(
@@ -238,7 +238,6 @@ async def send_admin_notification(context, order_data, is_free_items=False):
     except Exception as e:
         logger.error(f"❌ Failed to send to channel: {e}")
     
-    # 2. Send short notification to admin DM
     try:
         if channel_sent:
             short_notification = (
@@ -389,6 +388,9 @@ async def orders_history_command(update: Update, context: ContextTypes.DEFAULT_T
     ])
     await update.message.reply_text(history_text, parse_mode="Markdown", reply_markup=markup)
 
+# ---------------------------------------------------------
+# Books Database - PLACEHOLDER
+# ---------------------------------------------------------
 # ---------------------------------------------------------
 # 2. Books & Videos Database (Including Free Aviation Books)
 # ---------------------------------------------------------
@@ -1275,7 +1277,7 @@ def get_shop_categories_keyboard():
         [InlineKeyboardButton("📋 Order History", callback_data="view_orders")],
         [InlineKeyboardButton("🌐 Connect on Social Media", callback_data="socials_menu")],
         [InlineKeyboardButton("💡 Suggestions & Book Requests", callback_data="suggestions_menu")],
-        [InlineKeyboardButton("⭐ Support & Contribute", callback_data="donate_menu")],
+        [InlineKeyboardButton("⭐ Support & Contribute (Custom Stars)", callback_data="donate_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1362,7 +1364,17 @@ async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_terms(update, context):
         return
 
-    await show_donation_menu(update.message, is_new_message=True, is_callback=False)
+    user_id = update.effective_user.id
+    text = (
+        "⭐ *Support ATPL Edge Development*\n\n"
+        "💙 You can support the ongoing maintenance and development of the aviation training platform by donating any number of Telegram Stars you prefer.\n\n"
+        "📝 *Please send the number of stars you would like to donate as a message now.*\n\n"
+        "Example: `50` or `100` or `500`"
+    )
+    
+    user_expecting_donation[user_id] = True
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_terms(update, context):
@@ -1375,36 +1387,69 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_whatsapp_keyboard())
 
-async def show_donation_menu(message_obj, is_new_message=False, is_callback=True):
-    text = (
-        "⭐ *Support ATPL Edge Development*\n\n"
-        "💙 Support ongoing platform maintenance using Telegram Stars:"
-    )
+# ---------------------------------------------------------
+# Text Message Handler (For Manual Donation Input)
+# ---------------------------------------------------------
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages for manual donation input"""
+    user_id = update.effective_user.id
     
-    stars_999 = int(9.99 * STARS_PER_USD)
-    stars_1999 = int(19.99 * STARS_PER_USD)
-    stars_4999 = int(49.99 * STARS_PER_USD)
-    stars_9999 = int(99.99 * STARS_PER_USD)
+    if user_expecting_donation.get(user_id, False):
+        text_val = update.message.text.strip()
+        
+        try:
+            stars_val = int(text_val)
+            if stars_val <= 0:
+                raise ValueError()
+            
+            user_expecting_donation[user_id] = False
+            
+            usd_val = stars_val / STARS_PER_USD
+            title_text = f"ATPL Edge Custom Contribution ({stars_val} Stars)"
+            
+            await start_telegram_donation_checkout_manual(update, context, usd_val, stars_val, title_text)
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ *Invalid input!*\n\n"
+                "Please enter a valid positive number for Telegram Stars.\n"
+                "Example: `50` or `100`",
+                parse_mode="Markdown"
+            )
+        return
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"⭐ $9.99 ({stars_999} Stars)", callback_data="donate_9.99"),
-            InlineKeyboardButton(f"⭐ $19.99 ({stars_1999} Stars)", callback_data="donate_19.99"),
-        ],
-        [
-            InlineKeyboardButton(f"⭐ $49.99 ({stars_4999} Stars)", callback_data="donate_49.99"),
-            InlineKeyboardButton(f"⭐ $99.99 ({stars_9999} Stars)", callback_data="donate_99.99"),
-        ],
-        [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")],
-    ])
+# ---------------------------------------------------------
+# Manual Donation Checkout
+# ---------------------------------------------------------
+async def start_telegram_donation_checkout_manual(update, context, usd_amount, stars_amount, title):
+    """Create invoice for manual star donation"""
+    user_id = update.effective_user.id
+    payload = f"atpl_edge_donation_{user_id}_{int(time.time())}"
+    currency = "XTR"
+    
+    description = f"Supporting ATPL Edge with {stars_amount} Stars (${usd_amount:.2f}) contribution."
+    
+    prices = [LabeledPrice(title, stars_amount)]
+    chat_id = update.effective_chat.id
     
     try:
-        if is_new_message:
-            await message_obj.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
-        else:
-            await message_obj.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token="",
+            currency=currency,
+            prices=prices,
+            start_parameter="donation-payment",
+        )
+        logger.info(f"Manual donation invoice sent to user {user_id} for {stars_amount} stars")
     except Exception as e:
-        logger.error(f"Error in show_donation_menu: {e}")
+        logger.error(f"Error sending manual donation invoice: {e}")
+        await update.message.reply_text(
+            "❌ An error occurred while processing your donation. Please try again.",
+            parse_mode="Markdown"
+        )
 
 # ---------------------------------------------------------
 # Callback Handler
@@ -1466,24 +1511,15 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "donate_menu":
         text = (
             "⭐ *Support ATPL Edge Development*\n\n"
-            "💙 Support ongoing platform maintenance using Telegram Stars:"
+            "💙 You can support the ongoing maintenance and development of the aviation training platform by donating any number of Telegram Stars you prefer.\n\n"
+            "📝 *Please send the number of stars you would like to donate as a message now.*\n\n"
+            "Example: `50` or `100` or `500`"
         )
         
-        stars_999 = int(9.99 * STARS_PER_USD)
-        stars_1999 = int(19.99 * STARS_PER_USD)
-        stars_4999 = int(49.99 * STARS_PER_USD)
-        stars_9999 = int(99.99 * STARS_PER_USD)
+        user_expecting_donation[user_id] = True
 
         keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(f"⭐ $9.99 ({stars_999} Stars)", callback_data="donate_9.99"),
-                InlineKeyboardButton(f"⭐ $19.99 ({stars_1999} Stars)", callback_data="donate_19.99"),
-            ],
-            [
-                InlineKeyboardButton(f"⭐ $49.99 ({stars_4999} Stars)", callback_data="donate_49.99"),
-                InlineKeyboardButton(f"⭐ $99.99 ({stars_9999} Stars)", callback_data="donate_99.99"),
-            ],
-            [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")],
+            [InlineKeyboardButton("⬅️ Return to Main Menu", callback_data="back_to_categories")]
         ])
         
         sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="Markdown")
@@ -1517,18 +1553,6 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
             sent = await context.bot.send_message(chat_id=chat_id, text=history_text, reply_markup=markup, parse_mode="Markdown")
             user_cart_messages[user_id] = sent.message_id
-        return
-
-    elif data.startswith("donate_"):
-        amount_map = {
-            "donate_9.99": (9.99, int(9.99 * STARS_PER_USD), "ATPL Edge Contribution ($9.99)"),
-            "donate_19.99": (19.99, int(19.99 * STARS_PER_USD), "ATPL Edge Contribution ($19.99)"),
-            "donate_49.99": (49.99, int(49.99 * STARS_PER_USD), "ATPL Edge Contribution ($49.99)"),
-            "donate_99.99": (99.99, int(99.99 * STARS_PER_USD), "ATPL Edge Contribution ($99.99)"),
-        }
-        if data in amount_map:
-            usd_val, stars_val, title = amount_map[data]
-            await start_telegram_donation_checkout(query, user_id, context, usd_val, stars_val, title)
         return
 
     elif data.startswith("remove_cart_"):
@@ -1843,29 +1867,6 @@ async def start_telegram_stars_checkout(query, user_id, context):
         logger.error(f"Error sending invoice: {e}")
         await query.message.reply_text("❌ An error occurred. Please try again.", parse_mode="Markdown")
 
-async def start_telegram_donation_checkout(query, user_id, context, usd_amount, stars_amount, title):
-    description = f"Supporting ATPL Edge with ${usd_amount} contribution."
-    payload = f"atpl_edge_donation_{user_id}_{int(time.time())}"
-    currency = "XTR"
-
-    prices = [LabeledPrice(title, stars_amount)]
-    chat_id = query.message.chat_id
-
-    try:
-        await context.bot.send_invoice(
-            chat_id=chat_id,
-            title=title,
-            description=description,
-            payload=payload,
-            provider_token="",
-            currency=currency,
-            prices=prices,
-            start_parameter="donation-payment",
-        )
-    except Exception as e:
-        logger.error(f"Error sending donation invoice: {e}")
-        await query.message.reply_text("❌ An error occurred. Please try again.", parse_mode="Markdown")
-
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     await query.answer(ok=True)
@@ -1881,19 +1882,58 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
             donation_notification = f"""
 💰 *NEW DONATION!*
 
-👤 User: `{user_id}`
+━━━━━━━━━━━━━━━━━━━━━
+📋 *DONATION DETAILS:*
+━━━━━━━━━━━━━━━━━━━━━
+
+👤 User ID: `{user_id}`
 📝 Username: @{update.effective_user.username or 'Unknown'}
+👨‍✈️ Full Name: {update.effective_user.first_name} {update.effective_user.last_name or ''}
 ⭐ Stars: {payment_info.total_amount}
-📅 Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+💵 USD Equivalent: ${payment_info.total_amount / STARS_PER_USD:.2f}
+💳 Payment ID: `{payment_info.provider_payment_charge_id}`
+📅 Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} UTC
+
+━━━━━━━━━━━━━━━━━━━━━
 """
+            
+            # 1. إرسال الإشعار الكامل إلى القناة الخاصة
+            channel_sent = False
             try:
                 await context.bot.send_message(
-                    chat_id=ADMIN_USER_ID,
+                    chat_id=NOTIFICATION_CHANNEL_ID,
                     text=donation_notification,
                     parse_mode="Markdown"
                 )
+                logger.info(f"✅ Donation notification sent to private channel")
+                channel_sent = True
             except Exception as e:
-                logger.error(f"Failed to send donation notification to admin: {e}")
+                logger.error(f"❌ Failed to send donation to channel: {e}")
+            
+            # 2. إرسال إشعار مختصر للأدمن الشخصي
+            try:
+                if channel_sent:
+                    short_notification = (
+                        f"💰 *New Donation Received!*\n\n"
+                        f"⭐ Stars: {payment_info.total_amount}\n"
+                        f"👤 User: @{update.effective_user.username or 'Unknown'}\n"
+                        f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                        f"📋 *Full details in private channel.*"
+                    )
+                    await context.bot.send_message(
+                        chat_id=ADMIN_USER_ID,
+                        text=short_notification,
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_USER_ID,
+                        text=donation_notification,
+                        parse_mode="Markdown"
+                    )
+                logger.info(f"✅ Admin DM donation notification sent")
+            except Exception as e:
+                logger.error(f"❌ Failed to send admin DM donation notification: {e}")
             
             await update.message.reply_text(
                 "⭐ *THANK YOU FOR YOUR SUPPORT!*\n\n"
@@ -2057,6 +2097,8 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("donate", donate_command))
     application.add_handler(CommandHandler("help", help_command))
     
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    
     application.add_handler(CallbackQueryHandler(shop_callback))
     application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
@@ -2065,19 +2107,10 @@ if __name__ == "__main__":
 
     print("🤖 ATPL Edge Bot is running...")
     
-    # تشغيل Flask في خيط منفصل
     keep_alive()
     
-    # إنشاء event loop يدوياً
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
     try:
-        loop.run_until_complete(application.run_polling())
-    except KeyboardInterrupt:
-        print("Bot stopped by user")
+        application.run_polling()
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
         raise
-    finally:
-        loop.close()
