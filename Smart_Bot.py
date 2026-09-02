@@ -2111,7 +2111,7 @@ async def main():
     # تشغيل Flask في خيط منفصل
     keep_alive()
     
-    # تشغيل البوت
+    # تشغيل البوت - بدون إغلاق loop يدوي
     await application.run_polling()
 
 if __name__ == "__main__":
