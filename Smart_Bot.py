@@ -94,6 +94,7 @@ completed_orders = {}
 order_history = {}
 user_last_message_id = {}
 cart_creation_notified = set()
+user_expecting_donation = {}  # Track users who are expected to enter donation amount
 
 CART_EXPIRY_HOURS = 24
 BACKUP_FILE = "orders_backup.json"
@@ -1277,7 +1278,7 @@ def get_shop_categories_keyboard():
         [InlineKeyboardButton("📋 Order History", callback_data="view_orders")],
         [InlineKeyboardButton("🌐 Connect on Social Media", callback_data="socials_menu")],
         [InlineKeyboardButton("💡 Suggestions & Book Requests", callback_data="suggestions_menu")],
-        [InlineKeyboardButton("⭐ Support & Contribute (Custom Stars)", callback_data="donate_menu")],
+        [InlineKeyboardButton("⭐ Support & Contribute", callback_data="donate_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1508,7 +1509,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_cart_messages[user_id] = sent.message_id
         return
 
-    elif data == "donate_menu":
+        elif data == "donate_menu":
         text = (
             "⭐ *Support ATPL Edge Development*\n\n"
             "💙 You can support the ongoing maintenance and development of the aviation training platform by donating any number of Telegram Stars you prefer.\n\n"
