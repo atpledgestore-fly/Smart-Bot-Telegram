@@ -1509,7 +1509,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_cart_messages[user_id] = sent.message_id
         return
 
-        elif data == "donate_menu":
+    elif data == "donate_menu":
         text = (
             "⭐ *Support ATPL Edge Development*\n\n"
             "💙 You can support the ongoing maintenance and development of the aviation training platform by donating any number of Telegram Stars you prefer.\n\n"
