@@ -2067,8 +2067,9 @@ if __name__ == "__main__":
     
     keep_alive()
     
+    # استخدام asyncio.run لتشغيل البوت
     try:
-        application.run_polling()
+        asyncio.run(application.run_polling())
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
         raise
