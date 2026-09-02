@@ -2038,8 +2038,7 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
 # ---------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------
-async def main():
-    """Main async function"""
+if __name__ == "__main__":
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     application = (
         ApplicationBuilder()
@@ -2069,14 +2068,16 @@ async def main():
     # تشغيل Flask في خيط منفصل
     keep_alive()
     
-    # تشغيل البوت
-    await application.run_polling()
-
-if __name__ == "__main__":
+    # إنشاء event loop يدوياً
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     try:
-        asyncio.run(main())
+        loop.run_until_complete(application.run_polling())
     except KeyboardInterrupt:
         print("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
         raise
+    finally:
+        loop.close()
